@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# claude-fallback: sits in front of the real Claude Code CLI as `claude`.
+# When your Claude session is expired, out of quota, or you have no subscription,
+# it re-runs the same request on Ollama (which speaks the Anthropic Messages API).
+#
+#   claude --local ...             force the fallback
+#   CLAUDE_FALLBACK_OFF=1 claude   skip this wrapper entirely
+#
+# https://github.com/oyekamal/claude-local-fallback  (MIT)
+set -u
+
+MODELS=${CLAUDE_FALLBACK_MODELS:-"gemma4:31b-cloud llama3.2"}
+LOCAL_CTX=${CLAUDE_FALLBACK_CTX:-8192}
+LOCAL_TOOLS=${CLAUDE_FALLBACK_LOCAL_TOOLS:-0}  # 1 = run local models inside Claude Code (needs ~8 GB+ VRAM)
+OLLAMA=${CLAUDE_FALLBACK_OLLAMA_URL:-http://localhost:11434}
+MARKER=${CLAUDE_FALLBACK_MARKER:-$HOME/.claude-fallback/limited}  # interactive runs skip Claude for 30 min after a failure
+FAIL_RE='Failed to authenticate|OAuth (access )?token|Not logged in|/login|Invalid API key|usage limit|limit reached|hit your limit|Credit balance is too low|rate_limit_error|authentication_error'
+
+note() { echo "[claude-fallback] $*" >&2; }
+
+# The real CLI: first `claude` on PATH that isn't this script (or another copy of it).
+find_real() {
+  [ -n "${CLAUDE_FALLBACK_REAL:-}" ] && { echo "$CLAUDE_FALLBACK_REAL"; return; }
+  local c
+  while IFS= read -r c; do
+    [ "$c" -ef "$0" ] && continue
+    head -c 400 "$c" 2>/dev/null | grep -q 'claude-fallback' && continue
+    echo "$c"; return
+  done < <(type -ap claude)
+}
+REAL=$(find_real)
+
+if [ -n "${CLAUDE_FALLBACK_OFF:-}" ] || [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+  [ -n "$REAL" ] && exec "$REAL" "$@"; note "real claude not found on PATH"; exit 127
+fi
+case "${1:-}" in auth|login|logout|update|install|doctor|mcp|plugin|config|setup-token|migrate-installer|-v|--version|-h|--help)
+  [ -n "$REAL" ] && exec "$REAL" "$@"; note "real claude not found on PATH"; exit 127 ;;
+esac
+
+force=0; headless=0; args=()
+for a in "$@"; do
+  case "$a" in
+    --local) force=1 ;;
+    -p|--print) headless=1; args+=("$a") ;;
+    *) args+=("$a") ;;
+  esac
+done
+
+ensure_ollama() {
+  command -v ollama >/dev/null || { note "ollama is not installed: https://ollama.com/download"; return 1; }
+  curl -sf "$OLLAMA/api/version" >/dev/null && return 0
+  note "starting ollama serve"; (ollama serve >/dev/null 2>&1 &)
+  for _ in $(seq 20); do sleep 0.5; curl -sf "$OLLAMA/api/version" >/dev/null && return 0; done
+  note "ollama is not reachable at $OLLAMA"; return 1
+}
+
+# First model in the chain that answers. Cloud models get one tiny ping. Local models are
+# pulled if missing, then copied as cf-<name> with a bigger context window than Ollama's default.
+pick_model() {
+  local m alias mf ok
+  for m in $MODELS; do
+    if [[ $m == *cloud* ]]; then
+      curl -sf -m 15 "$OLLAMA/api/chat" -d "{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"options\":{\"num_predict\":1}}" >/dev/null \
+        && { echo "$m"; return 0; }
+      note "$m unavailable (offline, or run 'ollama signin'), trying next"; continue
+    fi
+    alias="cf-${m//[:\/]/-}"
+    if ! ollama show "$alias" >/dev/null 2>&1; then
+      ollama show "$m" >/dev/null 2>&1 || { note "downloading $m (first run only)"; ollama pull "$m" >&2 || continue; }
+      mf=$(mktemp)
+      printf 'FROM %s\nPARAMETER num_ctx %s\n' "$m" "$LOCAL_CTX" > "$mf"
+      ollama create "$alias" -f "$mf" >/dev/null 2>&1; ok=$?; rm -f "$mf"
+      ((ok == 0)) || { note "could not create $alias"; continue; }
+    fi
+    echo "$alias"; return 0
+  done
+  return 1
+}
+
+run_local() {
+  ensure_ollama || return 1
+  local model; model=$(pick_model) || { note "no fallback model available"; return 1; }
+  note "Claude unavailable, answering with Ollama model '$model'"
+  # Drop the caller's --model; keep every other flag with its value.
+  local out=() prompt="" drop=0 keep=0 a
+  for a in "${args[@]+"${args[@]}"}"; do
+    if ((drop)); then drop=0; continue; fi
+    if ((keep)); then keep=0; out+=("$a"); continue; fi
+    case "$a" in
+      --model|--fallback-model) drop=1 ;;
+      --model=*|--fallback-model=*) ;;
+      --output-format|--input-format|--append-system-prompt|--system-prompt|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--max-turns|--permission-mode|--settings|--add-dir|--mcp-config|--session-id|--resume|-r) keep=1; out+=("$a") ;;
+      -*) out+=("$a") ;;
+      *) [ -z "$prompt" ] && prompt=$a; out+=("$a") ;;
+    esac
+  done
+  # Small local models can't carry Claude Code's ~15K-token tool prompt on a laptop GPU
+  # (qwen3:4b on 4 GB VRAM: >10 min per turn), so by default they get plain chat, no tools.
+  if [[ $model != *cloud* ]] && [ "$LOCAL_TOOLS" != 1 ]; then
+    if ((headless)); then
+      local extra=""; [ -t 0 ] || extra=$(cat)
+      [ -n "$extra" ] && prompt="$prompt"$'\n'"$extra"
+      ollama run "$model" "$prompt" 2>/dev/null | sed -E $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g'
+    else
+      ollama run "$model"
+    fi
+    return
+  fi
+  [ -n "$REAL" ] || { note "real claude not found on PATH"; return 127; }
+  # --bare skips hooks and plugins (minutes of startup); it also skips CLAUDE.md, so add it back.
+  [ -f CLAUDE.md ] && out+=(--append-system-prompt "$(cat CLAUDE.md)")
+  ANTHROPIC_BASE_URL=$OLLAMA ANTHROPIC_API_KEY=ollama ANTHROPIC_AUTH_TOKEN= ANTHROPIC_MODEL= \
+  CLAUDE_CODE_OAUTH_TOKEN= CLAUDE_CODE_MAX_CONTEXT_TOKENS=128000 \
+    "$REAL" --bare --model "$model" "${out[@]+"${out[@]}"}"
+}
+
+limited_recently() { [ -n "$(find "$MARKER" -mmin -30 2>/dev/null)" ]; }
+mark_limited() { mkdir -p "$(dirname "$MARKER")" && touch "$MARKER"; }
+
+if ((force)) || [ -z "$REAL" ]; then
+  [ -z "$REAL" ] && note "Claude Code not installed; using Ollama only"
+  run_local; exit
+fi
+
+if ((!headless)); then
+  # Interactive: a session can't be swapped mid-way, so decide before starting.
+  if limited_recently || ! "$REAL" auth status 2>/dev/null | grep -q '"loggedIn": *true'; then
+    note "not logged in or recently out of quota ('claude login' to fix); using Ollama"
+    run_local; exit
+  fi
+  exec "$REAL" "${args[@]+"${args[@]}"}"
+fi
+
+# Headless: buffer stdin so it can be replayed if the first try fails.
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+if [ -t 0 ]; then : > "$tmp/in"; else cat > "$tmp/in"; fi
+"$REAL" "${args[@]+"${args[@]}"}" < "$tmp/in" > "$tmp/out" 2> "$tmp/err"; rc=$?
+if ((rc != 0)) && grep -qE "$FAIL_RE" "$tmp/out" "$tmp/err"; then
+  mark_limited
+  note "$(head -c 160 "$tmp/out")"
+  run_local < "$tmp/in"; exit
+fi
+cat "$tmp/out"; cat "$tmp/err" >&2; exit $rc
